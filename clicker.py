@@ -124,6 +124,52 @@ def _normalize(x: int, y: int) -> tuple[int, int]:
     return int(x * 65535 / w), int(y * 65535 / h)
 
 
+def _find_popup_skip(hdc: int, screen_w: int, screen_h: int) -> tuple[int, int] | None:
+    """Locate the Skip button in the Outbreaks Charge popup.
+
+    Strategy (language-independent):
+      1. Coarse-scan the centre region for the *purple* Trigger button.
+      2. From that anchor, scan downward for a wide band of *dark grey* — the Skip button.
+    Returns pixel (x, y) to click, or None.
+    """
+    get_pixel = ctypes.windll.gdi32.GetPixel
+    cx, cy = screen_w // 2, screen_h // 2
+
+    # ── Step 1: find a purple pixel (Trigger button) ──────────────────────
+    purple = None
+    for py in range(cy - 230, cy + 130, 10):
+        for px in range(cx - 300, cx + 300, 10):
+            c = get_pixel(hdc, px, py)
+            r, g, b = c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF
+            # Purple/violet: B dominant, R medium, G clearly lowest
+            if b > 145 and r > 105 and b > r > g and g < 140:
+                purple = (px, py)
+                break
+        if purple:
+            break
+
+    if not purple:
+        return None
+
+    ax, ay = purple  # anchor inside the Trigger button
+
+    # ── Step 2: scan downward from anchor for the dark-grey Skip band ─────
+    for dy in range(45, 210, 4):
+        ty = ay + dy
+        hits = 0
+        for dx in range(-110, 110, 9):
+            c = get_pixel(hdc, ax + dx, ty)
+            r, g, b = c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF
+            # Dark grey: all channels low & roughly equal
+            if 35 <= r <= 88 and 35 <= g <= 88 and 35 <= b <= 88 \
+                    and abs(r - g) < 18 and abs(g - b) < 18:
+                hits += 1
+        if hits >= 10:          # wide enough to confirm it's a button
+            return ax, ty
+
+    return None
+
+
 def _pixel_is_golden(hdc: int, x: int, y: int) -> bool:
     """Return True if any sample point around (x, y) looks like the golden sphere.
 
@@ -175,6 +221,7 @@ class ClickerApp:
         self._point_var       = tk.StringVar(value="Not set")
         self._hotkey_var      = tk.StringVar(value=DEFAULT_HOTKEY.upper())
         self._avoid_golden    = tk.BooleanVar(value=True)
+        self._auto_skip       = tk.BooleanVar(value=True)
         self._letters_toggle  = tk.BooleanVar(value=False)
         self._target_cps      = tk.IntVar(value=DEFAULT_TARGET_CPS)
         self._golden_cooldown = tk.DoubleVar(value=DEFAULT_GOLDEN_COOLDOWN)
@@ -294,6 +341,13 @@ class ClickerApp:
                     format="%.1f", command=self._save_config).grid(row=0, column=1, padx=(6, 2))
         ttk.Label(cf, text="s", foreground="#555").grid(row=0, column=2)
 
+        ttk.Checkbutton(
+            gf,
+            text="Auto-click Skip on Outbreaks popup  (detects purple→grey button pattern)",
+            variable=self._auto_skip,
+            command=self._save_config,
+        ).grid(row=2, column=0, sticky="w", pady=(6, 0))
+
         # ── Hotkey ──
         hf = ttk.LabelFrame(self.root, text=" Toggle Hotkey ", padding=8)
         hf.grid(row=4, column=0, sticky="ew", **PAD)
@@ -383,6 +437,9 @@ class ClickerApp:
         if isinstance(cfg.get("avoid_golden"), bool):
             self._avoid_golden.set(cfg["avoid_golden"])
 
+        if isinstance(cfg.get("auto_skip"), bool):
+            self._auto_skip.set(cfg["auto_skip"])
+
         if isinstance(cfg.get("golden_cooldown"), (int, float)):
             self._golden_cooldown.set(float(cfg["golden_cooldown"]))
 
@@ -401,6 +458,7 @@ class ClickerApp:
             "keys":         {k: v.get() for k, v in self._key_vars.items()},
             "hotkey":       self._current_hotkey,
             "avoid_golden":    self._avoid_golden.get(),
+            "auto_skip":       self._auto_skip.get(),
             "golden_cooldown": round(self._golden_cooldown.get(), 1),
             "target_cps":      self._target_cps.get(),
             "letters_toggle":  self._letters_toggle.get(),
@@ -493,6 +551,7 @@ class ClickerApp:
         self.running = True
         self._set_status(True)
         threading.Thread(target=self._loop, args=(hwnd,), daemon=True).start()
+        threading.Thread(target=self._popup_watcher, daemon=True).start()
         self._tick_cps()
 
     def _stop(self):
@@ -510,6 +569,48 @@ class ClickerApp:
 
         win32gui.EnumWindows(cb, None)
         return found[0] if found else None
+
+    # ── Popup watcher ──────────────────────────────────────────────────────
+
+    def _popup_watcher(self):
+        """Separate thread: scans for the Outbreaks popup and clicks Skip."""
+        hdc      = ctypes.windll.user32.GetDC(0)
+        screen_w = ctypes.windll.user32.GetSystemMetrics(0)
+        screen_h = ctypes.windll.user32.GetSystemMetrics(1)
+        send     = ctypes.windll.user32.SendInput
+        sz       = ctypes.sizeof(Input)
+
+        while self.running:
+            time.sleep(0.35)
+
+            if not self._auto_skip.get():
+                continue
+
+            pos = _find_popup_skip(hdc, screen_w, screen_h)
+            if pos is None:
+                continue
+
+            sx, sy = pos
+            nx, ny = _normalize(sx, sy)
+
+            # Move cursor to Skip button then send click
+            orig = win32api.GetCursorPos()
+            ctypes.windll.user32.SetCursorPos(sx, sy)
+            time.sleep(0.06)
+
+            click = (Input * 2)(
+                _mouse_evt(nx, ny, MOUSEEVENTF_LEFTDOWN),
+                _mouse_evt(nx, ny, MOUSEEVENTF_LEFTUP),
+            )
+            send(2, click, sz)
+
+            time.sleep(0.12)
+            ctypes.windll.user32.SetCursorPos(*orig)
+
+            # Back-off so we don't re-trigger on the same popup
+            time.sleep(1.2)
+
+        ctypes.windll.user32.ReleaseDC(0, hdc)
 
     # ── Clicker loop ───────────────────────────────────────────────────────
 
