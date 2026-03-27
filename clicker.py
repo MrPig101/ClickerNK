@@ -123,16 +123,17 @@ def _normalize(x: int, y: int) -> tuple[int, int]:
     return int(x * 65535 / w), int(y * 65535 / h)
 
 
-def _find_popup_skip(hwnd: int) -> tuple[int, int] | None:
+def _find_popup_skip(hwnd: int, sct=None) -> tuple[int, int] | None:
     """Locate the Skip button in any charge popup (language-independent).
 
-    Uses PIL ImageGrab (not GetPixel) so it correctly captures hardware-
-    accelerated game windows.  Looks for a horizontal band of purple pixels
-    (Trigger button) followed by a band of dark-grey pixels below it (Skip).
+    Uses mss for fast screen capture (hardware-accelerated windows safe).
+    Looks for a horizontal band of purple pixels (Trigger button) followed
+    by a tall band of grey/teal pixels below it (Skip button).
 
     Returns screen pixel (x, y) centre of the Skip button, or None.
+    Pass an open mss.mss() instance as `sct` to avoid per-call overhead.
     """
-    from PIL import ImageGrab
+    import mss as _mss
 
     try:
         wx1, wy1, wx2, wy2 = win32gui.GetWindowRect(hwnd)
@@ -151,22 +152,31 @@ def _find_popup_skip(hwnd: int) -> tuple[int, int] | None:
     sy1 = cy - wh * 3 // 10
     sy2 = cy + wh * 3 // 10
 
-    img    = ImageGrab.grab(bbox=(sx1, sy1, sx2, sy2))
-    pixels = img.load()
-    iw, ih = img.size
+    mon = {"left": sx1, "top": sy1, "width": sx2 - sx1, "height": sy2 - sy1}
+    _own_sct = sct is None
+    if _own_sct:
+        sct = _mss.mss()
+    raw = memoryview(bytes(sct.grab(mon).raw))  # BGRA bytes
+    if _own_sct:
+        sct.close()
+    iw, ih = sx2 - sx1, sy2 - sy1
+    stride = iw * 4  # 4 bytes per pixel (BGRA)
 
     STEP      = 6
     scan_cols = max(1, iw // STEP)
     min_hits  = max(5, scan_cols // 5)
 
+    # Helper: get R, G, B from raw BGRA memoryview at image pixel (px, py)
+    def px_rgb(px: int, py: int) -> tuple[int, int, int]:
+        o = py * stride + px * 4
+        return raw[o + 2], raw[o + 1], raw[o]   # R, G, B (BGRA order)
+
     # ── Phase 1: find the FULL extent of the purple (Trigger button) band ───
-    # Scan all rows and track the last row that still qualifies — this gives us
-    # the bottom edge of the button so Phase 2 starts safely below it.
     trigger_band_bottom = None
     for py in range(0, ih, STEP):
         hits = 0
         for px in range(0, iw, STEP):
-            r, g, b = pixels[px, py]
+            r, g, b = px_rgb(px, py)
             if b > 130 and r > 90 and b > r and r > g and g < 165:
                 hits += 1
         if hits >= min_hits:
@@ -176,10 +186,8 @@ def _find_popup_skip(hwnd: int) -> tuple[int, int] | None:
         return None
 
     # ── Phase 2: find the Skip button band below Trigger ──────────────────
-    # The Trigger button has a thin dark border whose pixels can match grey/teal.
-    # We require the band to span at least MIN_SKIP_ROWS rows — real buttons are
-    # tall; borders are not.  If a thin band ends, reset and keep searching.
-    MIN_SKIP_ROWS = 7   # ~28 px minimum height to qualify as a real button
+    # Require ≥ MIN_SKIP_ROWS to reject the Trigger's thin bottom border.
+    MIN_SKIP_ROWS = 7
 
     skip_rows:   list[int] = []
     skip_x_sums: list[int] = []
@@ -192,7 +200,7 @@ def _find_popup_skip(hwnd: int) -> tuple[int, int] | None:
         hits  = 0
         x_sum = 0
         for px in range(0, iw, STEP):
-            r, g, b = pixels[px, ty_rel]
+            r, g, b = px_rgb(px, ty_rel)
             is_grey = (26 <= r <= 90 and 26 <= g <= 90 and 26 <= b <= 90
                        and abs(r - g) < 26 and abs(r - b) < 26)
             is_teal = r < 80 and g > 140 and b > 140 and abs(g - b) < 50
@@ -205,9 +213,8 @@ def _find_popup_skip(hwnd: int) -> tuple[int, int] | None:
             skip_hits.append(hits)
         elif skip_rows:
             if len(skip_rows) >= MIN_SKIP_ROWS:
-                break  # real button band found and ended — use it
+                break
             else:
-                # Too thin — just the Trigger border, reset and keep looking
                 skip_rows.clear()
                 skip_x_sums.clear()
                 skip_hits.clear()
@@ -224,24 +231,34 @@ def _find_popup_skip(hwnd: int) -> tuple[int, int] | None:
 
 _GOLDEN_RADIUS = 25   # px around cursor to scan for golden sphere
 
-def _pixel_is_golden(x: int, y: int) -> bool:
+def _pixel_is_golden(x: int, y: int, sct=None) -> bool:
     """Return True if the golden sphere is visible near (x, y).
 
-    Grabs a (2R+1)² region via PIL ImageGrab and scans every 3 px — no extra
-    system calls since the whole image is already in memory.
+    Uses mss for fast capture and raw BGRA memoryview for zero-overhead
+    pixel access — no PIL getpixel() overhead.
+    Pass an open mss.mss() instance as `sct` to avoid per-call init cost.
 
     Two colour signatures:
       • Orange/amber body  — R clearly dominant over G and B
       • Yellow orbital rings — R ≈ G both high, B low
     """
-    from PIL import ImageGrab
-    R = _GOLDEN_RADIUS
-    img = ImageGrab.grab(bbox=(x - R, y - R, x + R + 1, y + R + 1))
-    iw, ih = img.size
-    STEP = 3
-    for py in range(0, ih, STEP):
+    import mss as _mss
+    R    = _GOLDEN_RADIUS
+    mon  = {"left": x - R, "top": y - R, "width": 2 * R + 1, "height": 2 * R + 1}
+    _own = sct is None
+    if _own:
+        sct = _mss.mss()
+    raw    = memoryview(bytes(sct.grab(mon).raw))  # BGRA
+    if _own:
+        sct.close()
+    iw     = 2 * R + 1
+    stride = iw * 4
+    STEP   = 3
+    for py in range(0, 2 * R + 1, STEP):
+        row = py * stride
         for px in range(0, iw, STEP):
-            r, g, b = img.getpixel((px, py))
+            o = row + px * 4
+            b, g, r = raw[o], raw[o + 1], raw[o + 2]  # BGRA order
             if r > 120 and g > 70 and b < 100 and r > g and (r - b) > 70:
                 return True
             if r > 160 and g > 140 and b < 90 and abs(r - g) < 60 and (r - b) > 80:
@@ -800,21 +817,16 @@ class ClickerApp:
         threading.Thread(target=_run, daemon=True).start()
 
     def _golden_watcher(self):
-        """Daemon thread: samples cursor position for golden sphere at ~20 Hz.
-
-        Runs PIL ImageGrab off the click loop so the hot path has zero PIL
-        overhead — the loop just reads the shared _gold_last_seen float.
-        """
-        while self.running:
-            mode = self._golden_mode.get()
-            if mode == "avoid":
-                # Pause clicking when golden is detected
-                mx, my = win32api.GetCursorPos()
-                if _pixel_is_golden(mx, my):
-                    self._gold_last_seen = time.perf_counter()
-            # "auto" mode: _gold_last_seen is only set by popup_watcher after popup dismiss
-            # "off" mode: never update _gold_last_seen
-            time.sleep(0.03)
+        """Daemon thread: samples cursor for golden sphere, reusing one mss context."""
+        import mss as _mss
+        with _mss.mss() as sct:
+            while self.running:
+                mode = self._golden_mode.get()
+                if mode == "avoid":
+                    mx, my = win32api.GetCursorPos()
+                    if _pixel_is_golden(mx, my, sct):
+                        self._gold_last_seen = time.perf_counter()
+                time.sleep(0.03)
 
     def _popup_watcher(self, hwnd: int):
         """Separate thread: scans for charge popups and optionally clicks Skip.
@@ -822,55 +834,55 @@ class ClickerApp:
         Sets _popup_active=True as soon as a popup is detected so the clicker
         pauses immediately, regardless of whether auto-skip is enabled.
         """
+        import mss as _mss
         send = ctypes.windll.user32.SendInput
         sz   = ctypes.sizeof(Input)
 
-        while self.running:
-            time.sleep(0.3)
-
-            pos = _find_popup_skip(hwnd)
-
-            if pos is None:
-                if self._popup_active:
-                    self._popup_active = False
-                continue
-
-            # ── Debounce: confirm popup is still there 200 ms later ────────
-            time.sleep(0.2)
-            pos = _find_popup_skip(hwnd)
-            if pos is None:
-                continue  # transient false positive — ignore
-
-            # ── Confirmed popup — pause the clicker ────────────────────────
-            self._popup_active = True
-            mode = self._golden_mode.get()
-
-            if mode in ("avoid", "auto"):   # both modes auto-skip the popup
-                sx, sy = pos
-                nx, ny = _normalize(sx, sy)
-                orig = win32api.GetCursorPos()
-                ctypes.windll.user32.SetCursorPos(sx, sy)
-                time.sleep(0.06)
-                click = (Input * 2)(
-                    _mouse_evt(nx, ny, MOUSEEVENTF_LEFTDOWN),
-                    _mouse_evt(nx, ny, MOUSEEVENTF_LEFTUP),
-                )
-                send(2, click, sz)
-                time.sleep(0.12)
-                ctypes.windll.user32.SetCursorPos(*orig)
-
-            # ── Wait until the popup is gone before clearing the flag ──────
-            for _ in range(20):        # up to ~6 s
+        with _mss.mss() as sct:
+            while self.running:
                 time.sleep(0.3)
-                if _find_popup_skip(hwnd) is None:
-                    break
 
-            # In auto mode: briefly avoid goldens after popup dismiss so the
-            # clicker returns to the target before the next golden is clicked.
-            if mode == "auto":
-                self._gold_last_seen = time.perf_counter()
+                pos = _find_popup_skip(hwnd, sct)
 
-            self._popup_active = False
+                if pos is None:
+                    if self._popup_active:
+                        self._popup_active = False
+                    continue
+
+                # ── Debounce: confirm popup is still there 200 ms later ────
+                time.sleep(0.2)
+                pos = _find_popup_skip(hwnd, sct)
+                if pos is None:
+                    continue
+
+                # ── Confirmed popup — pause the clicker ────────────────────
+                self._popup_active = True
+                mode = self._golden_mode.get()
+
+                if mode in ("avoid", "auto"):
+                    sx, sy = pos
+                    nx, ny = _normalize(sx, sy)
+                    orig = win32api.GetCursorPos()
+                    ctypes.windll.user32.SetCursorPos(sx, sy)
+                    time.sleep(0.06)
+                    click = (Input * 2)(
+                        _mouse_evt(nx, ny, MOUSEEVENTF_LEFTDOWN),
+                        _mouse_evt(nx, ny, MOUSEEVENTF_LEFTUP),
+                    )
+                    send(2, click, sz)
+                    time.sleep(0.12)
+                    ctypes.windll.user32.SetCursorPos(*orig)
+
+                # ── Wait until popup is gone ────────────────────────────────
+                for _ in range(20):
+                    time.sleep(0.3)
+                    if _find_popup_skip(hwnd, sct) is None:
+                        break
+
+                if mode == "auto":
+                    self._gold_last_seen = time.perf_counter()
+
+                self._popup_active = False
 
     # ── Clicker loop ───────────────────────────────────────────────────────
 
