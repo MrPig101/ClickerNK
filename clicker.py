@@ -13,7 +13,7 @@ from tkinter import ttk, messagebox
 
 import keyboard
 import win32api
-import win32con
+import win32con 
 import win32gui
 
 # Config file sits next to the exe (frozen) or the script (dev)
@@ -76,7 +76,6 @@ _LETTER_KEYS_RAW = [chr(c) for c in range(0x41, 0x5B)
 KEY_MAP: dict[str, int] = {
     "Space": 0x20,
     "Ctrl":  0xA2,
-    "Alt":   0xA4,
     "0": 0x30,
     "1": 0x31, "2": 0x32, "3": 0x33, "4": 0x34, "5": 0x35,
     "6": 0x36, "7": 0x37, "8": 0x38, "9": 0x39,
@@ -89,9 +88,9 @@ NUMBER_KEYS    = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
 NUMPAD_KEYS    = ["Num0", "Num1", "Num2", "Num3", "Num4", "Num5",
                   "Num6", "Num7", "Num8", "Num9"]
 LETTER_KEYS    = _LETTER_KEYS_RAW          # A-Z excl. WASD
-DEFAULT_GOLDEN_COOLDOWN = 1.2              # seconds to pause after last golden detection
-DEFAULT_TARGET_CPS      = 60              # clicks per second sent to the game
-DEFAULT_HOTKEY = "f4"
+DEFAULT_GOLDEN_COOLDOWN = 2.0              # seconds to pause after last golden detection
+DEFAULT_TARGET_CPS      = 200              # clicks per second sent to the game
+DEFAULT_HOTKEY = "f3"
 GAME_TITLE     = "Cell to Singularity"
 
 # ─── Input builders ────────────────────────────────────────────────────────
@@ -124,72 +123,129 @@ def _normalize(x: int, y: int) -> tuple[int, int]:
     return int(x * 65535 / w), int(y * 65535 / h)
 
 
-def _find_popup_skip(hdc: int, screen_w: int, screen_h: int) -> tuple[int, int] | None:
-    """Locate the Skip button in the Outbreaks Charge popup.
+def _find_popup_skip(hwnd: int) -> tuple[int, int] | None:
+    """Locate the Skip button in any charge popup (language-independent).
 
-    Strategy (language-independent):
-      1. Coarse-scan the centre region for the *purple* Trigger button.
-      2. From that anchor, scan downward for a wide band of *dark grey* — the Skip button.
-    Returns pixel (x, y) to click, or None.
+    Uses PIL ImageGrab (not GetPixel) so it correctly captures hardware-
+    accelerated game windows.  Looks for a horizontal band of purple pixels
+    (Trigger button) followed by a band of dark-grey pixels below it (Skip).
+
+    Returns screen pixel (x, y) centre of the Skip button, or None.
     """
-    get_pixel = ctypes.windll.gdi32.GetPixel
-    cx, cy = screen_w // 2, screen_h // 2
+    from PIL import ImageGrab
 
-    # ── Step 1: find a purple pixel (Trigger button) ──────────────────────
-    purple = None
-    for py in range(cy - 230, cy + 130, 10):
-        for px in range(cx - 300, cx + 300, 10):
-            c = get_pixel(hdc, px, py)
-            r, g, b = c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF
-            # Purple/violet: B dominant, R medium, G clearly lowest
-            if b > 145 and r > 105 and b > r > g and g < 140:
-                purple = (px, py)
-                break
-        if purple:
-            break
-
-    if not purple:
+    try:
+        wx1, wy1, wx2, wy2 = win32gui.GetWindowRect(hwnd)
+    except Exception:
         return None
 
-    ax, ay = purple  # anchor inside the Trigger button
+    ww, wh = wx2 - wx1, wy2 - wy1
+    if ww < 100 or wh < 100:
+        return None
 
-    # ── Step 2: scan downward from anchor for the dark-grey Skip band ─────
-    for dy in range(45, 210, 4):
-        ty = ay + dy
+    cx, cy = (wx1 + wx2) // 2, (wy1 + wy2) // 2
+
+    # Restrict scan to centre 40 % × 60 % of the window — popup is always centred
+    sx1 = cx - ww // 5
+    sx2 = cx + ww // 5
+    sy1 = cy - wh * 3 // 10
+    sy2 = cy + wh * 3 // 10
+
+    img    = ImageGrab.grab(bbox=(sx1, sy1, sx2, sy2))
+    pixels = img.load()
+    iw, ih = img.size
+
+    STEP      = 6
+    scan_cols = max(1, iw // STEP)
+    min_hits  = max(5, scan_cols // 5)
+
+    # ── Phase 1: find the FULL extent of the purple (Trigger button) band ───
+    # Scan all rows and track the last row that still qualifies — this gives us
+    # the bottom edge of the button so Phase 2 starts safely below it.
+    trigger_band_bottom = None
+    for py in range(0, ih, STEP):
         hits = 0
-        for dx in range(-110, 110, 9):
-            c = get_pixel(hdc, ax + dx, ty)
-            r, g, b = c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF
-            # Dark grey: all channels low & roughly equal
-            if 35 <= r <= 88 and 35 <= g <= 88 and 35 <= b <= 88 \
-                    and abs(r - g) < 18 and abs(g - b) < 18:
+        for px in range(0, iw, STEP):
+            r, g, b = pixels[px, py]
+            if b > 130 and r > 90 and b > r and r > g and g < 165:
                 hits += 1
-        if hits >= 10:          # wide enough to confirm it's a button
-            return ax, ty
+        if hits >= min_hits:
+            trigger_band_bottom = py
 
-    return None
+    if trigger_band_bottom is None:
+        return None
+
+    # ── Phase 2: find the Skip button band below Trigger ──────────────────
+    # The Trigger button has a thin dark border whose pixels can match grey/teal.
+    # We require the band to span at least MIN_SKIP_ROWS rows — real buttons are
+    # tall; borders are not.  If a thin band ends, reset and keep searching.
+    MIN_SKIP_ROWS = 7   # ~28 px minimum height to qualify as a real button
+
+    skip_rows:   list[int] = []
+    skip_x_sums: list[int] = []
+    skip_hits:   list[int] = []
+
+    for dy in range(STEP * 2, 280, 4):
+        ty_rel = trigger_band_bottom + dy
+        if ty_rel >= ih:
+            break
+        hits  = 0
+        x_sum = 0
+        for px in range(0, iw, STEP):
+            r, g, b = pixels[px, ty_rel]
+            is_grey = (26 <= r <= 90 and 26 <= g <= 90 and 26 <= b <= 90
+                       and abs(r - g) < 26 and abs(r - b) < 26)
+            is_teal = r < 80 and g > 140 and b > 140 and abs(g - b) < 50
+            if is_grey or is_teal:
+                hits  += 1
+                x_sum += (sx1 + px)
+        if hits >= min_hits:
+            skip_rows.append(ty_rel)
+            skip_x_sums.append(x_sum)
+            skip_hits.append(hits)
+        elif skip_rows:
+            if len(skip_rows) >= MIN_SKIP_ROWS:
+                break  # real button band found and ended — use it
+            else:
+                # Too thin — just the Trigger border, reset and keep looking
+                skip_rows.clear()
+                skip_x_sums.clear()
+                skip_hits.clear()
+
+    if len(skip_rows) < MIN_SKIP_ROWS:
+        return None
+
+    # Centre of the Skip button band
+    mid_y      = skip_rows[len(skip_rows) // 2]
+    total_x    = sum(skip_x_sums)
+    total_hits = sum(skip_hits)
+    return total_x // total_hits, sy1 + mid_y
 
 
-def _pixel_is_golden(hdc: int, x: int, y: int) -> bool:
-    """Return True if any sample point around (x, y) looks like the golden sphere.
+_GOLDEN_RADIUS = 25   # px around cursor to scan for golden sphere
 
-    Samples a wider 9-point grid (±12 px) because the sphere centre can appear
-    white/bright — the gold colour lives on the ring edge.
-    Thresholds: warm orange/amber, R dominant, B low.
+def _pixel_is_golden(x: int, y: int) -> bool:
+    """Return True if the golden sphere is visible near (x, y).
+
+    Grabs a (2R+1)² region via PIL ImageGrab and scans every 3 px — no extra
+    system calls since the whole image is already in memory.
+
+    Two colour signatures:
+      • Orange/amber body  — R clearly dominant over G and B
+      • Yellow orbital rings — R ≈ G both high, B low
     """
-    get_pixel = ctypes.windll.gdi32.GetPixel
-    for px, py in (
-        (x,      y     ),
-        (x + 12, y     ), (x - 12, y     ),
-        (x,      y + 12), (x,      y - 12),
-        (x + 9,  y + 9 ), (x - 9,  y + 9 ),
-        (x + 9,  y - 9 ), (x - 9,  y - 9 ),
-    ):
-        c = get_pixel(hdc, px, py)
-        r, g, b = c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF
-        # Gold/orange/amber: R clearly dominant, G moderate, B low
-        if r > 120 and g > 70 and b < 100 and r > g and (r - b) > 70:
-            return True
+    from PIL import ImageGrab
+    R = _GOLDEN_RADIUS
+    img = ImageGrab.grab(bbox=(x - R, y - R, x + R + 1, y + R + 1))
+    iw, ih = img.size
+    STEP = 3
+    for py in range(0, ih, STEP):
+        for px in range(0, iw, STEP):
+            r, g, b = img.getpixel((px, py))
+            if r > 120 and g > 70 and b < 100 and r > g and (r - b) > 70:
+                return True
+            if r > 160 and g > 140 and b < 90 and abs(r - g) < 60 and (r - b) > 80:
+                return True
     return False
 
 
@@ -201,8 +257,9 @@ class ClickerApp:
 
         self.target_x: int | None = None
         self.target_y: int | None = None
-        self.running  = False
-        self._cps     = 0
+        self.running       = False
+        self._cps          = 0
+        self._gold_last_seen: float = -999.0
 
         # Pre-built SendInput array (rebuilt on point/key change)
         self._arr:     ctypes.Array | None = None
@@ -220,18 +277,25 @@ class ClickerApp:
         self._cps_var         = tk.StringVar(value="CPS: –")
         self._point_var       = tk.StringVar(value="Not set")
         self._hotkey_var      = tk.StringVar(value=DEFAULT_HOTKEY.upper())
-        self._avoid_golden    = tk.BooleanVar(value=True)
-        self._auto_skip       = tk.BooleanVar(value=True)
+        self._golden_mode     = tk.StringVar(value="avoid")  # "off" | "avoid" | "auto"
         self._letters_toggle  = tk.BooleanVar(value=False)
         self._target_cps      = tk.IntVar(value=DEFAULT_TARGET_CPS)
         self._golden_cooldown = tk.DoubleVar(value=DEFAULT_GOLDEN_COOLDOWN)
 
         self._current_hotkey: str = DEFAULT_HOTKEY
-        self._hotkey_handle = None
+        self._hotkey_handle  = None
+        self._popup_active   = False
 
         self._build_ui()
         self._load_config()
         self._register_hotkey(self._current_hotkey)
+
+        # Stop clicker immediately if user presses Alt manually
+        self._alt_hooks = [
+            keyboard.on_press_key("left alt",  lambda _: self._on_alt_press()),
+            # keyboard.on_press_key("right alt", lambda _: self._on_alt_press()),
+        ]
+
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ── UI ─────────────────────────────────────────────────────────────────
@@ -261,7 +325,7 @@ class ClickerApp:
         kf.grid(row=1, column=0, sticky="ew", **PAD)
 
         # Special keys row
-        for col, k in enumerate(["Space", "Ctrl", "Alt"]):
+        for col, k in enumerate(["Space", "Ctrl"]):
             ttk.Checkbutton(
                 kf, text=k, variable=self._key_vars[k],
                 command=self._on_keys_changed,
@@ -319,34 +383,45 @@ class ClickerApp:
         ttk.Label(sf, textvariable=self._cps_var,
                   font=("Consolas", 10)).grid(row=0, column=2, padx=(16, 0))
 
-        ttk.Label(sf, text="Limit:", foreground="#555").grid(row=0, column=3, padx=(16, 2))
-        ttk.Spinbox(sf, from_=1, to=500, textvariable=self._target_cps, width=5,
-                    command=self._save_config).grid(row=0, column=4)
-        ttk.Label(sf, text="CPS", foreground="#555").grid(row=0, column=5, padx=(2, 0))
+        # Popup detection indicator
+        self._popup_dot = tk.Label(sf, text="● popup", fg="#444444",
+                                   font=("Segoe UI", 8))
+        self._popup_dot.grid(row=0, column=3, padx=(14, 0))
 
-        # ── Golden avoidance ──
-        gf = ttk.LabelFrame(self.root, text=" Golden Sphere Avoidance ", padding=8)
+        ttk.Label(sf, text="Limit:", foreground="#555").grid(row=0, column=4, padx=(14, 2))
+        ttk.Spinbox(sf, from_=1, to=500, textvariable=self._target_cps, width=5,
+                    command=self._save_config).grid(row=0, column=5)
+        ttk.Label(sf, text="CPS", foreground="#555").grid(row=0, column=6, padx=(2, 0))
+
+        # ── Golden / Popup mode ──
+        gf = ttk.LabelFrame(self.root, text=" Golden Sphere & Popup ", padding=8)
         gf.grid(row=3, column=0, sticky="ew", **PAD)
-        ttk.Checkbutton(
-            gf,
-            text="Pause clicking when golden sphere detected at target",
-            variable=self._avoid_golden,
-            command=self._save_config,
-        ).grid(row=0, column=0, sticky="w")
+
+        # Mode radio buttons
+        modes = [
+            ("off",   "Off  — no special golden/popup handling"),
+            ("avoid", "Avoid  — pause clicking when golden sphere detected"),
+            ("auto",  "Auto  — click goldens; auto-skip popup, then briefly avoid"),
+        ]
+        for row_i, (val, label) in enumerate(modes):
+            ttk.Radiobutton(
+                gf, text=label, variable=self._golden_mode, value=val,
+                command=self._save_config,
+            ).grid(row=row_i, column=0, sticky="w", pady=1)
+
+        # Cooldown row (relevant for avoid + auto modes)
         cf = ttk.Frame(gf)
-        cf.grid(row=1, column=0, sticky="w", pady=(4, 0))
-        ttk.Label(cf, text="Cooldown after last detection:").grid(row=0, column=0, sticky="w")
+        cf.grid(row=3, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(cf, text="Cooldown:").grid(row=0, column=0, sticky="w")
         ttk.Spinbox(cf, from_=0.2, to=5.0, increment=0.1,
                     textvariable=self._golden_cooldown, width=5,
                     format="%.1f", command=self._save_config).grid(row=0, column=1, padx=(6, 2))
         ttk.Label(cf, text="s", foreground="#555").grid(row=0, column=2)
-
-        ttk.Checkbutton(
-            gf,
-            text="Auto-click Skip on Outbreaks popup  (detects purple→grey button pattern)",
-            variable=self._auto_skip,
-            command=self._save_config,
-        ).grid(row=2, column=0, sticky="w", pady=(6, 0))
+        if not getattr(sys, "frozen", False):   # debug buttons only when run as script
+            ttk.Button(cf, text="Capture golden", width=13,
+                       command=self._debug_capture_golden).grid(row=0, column=3, padx=(16, 0))
+            ttk.Button(cf, text="Capture popup", width=12,
+                       command=self._debug_capture).grid(row=0, column=4, padx=(6, 0))
 
         # ── Hotkey ──
         hf = ttk.LabelFrame(self.root, text=" Toggle Hotkey ", padding=8)
@@ -434,11 +509,11 @@ class ClickerApp:
             self._current_hotkey = hotkey
             self._hotkey_var.set(hotkey.upper())
 
-        if isinstance(cfg.get("avoid_golden"), bool):
-            self._avoid_golden.set(cfg["avoid_golden"])
-
-        if isinstance(cfg.get("auto_skip"), bool):
-            self._auto_skip.set(cfg["auto_skip"])
+        if cfg.get("golden_mode") in ("off", "avoid", "auto"):
+            self._golden_mode.set(cfg["golden_mode"])
+        elif isinstance(cfg.get("avoid_golden"), bool):
+            # Migrate old config: avoid_golden + auto_skip → golden_mode
+            self._golden_mode.set("avoid" if cfg["avoid_golden"] else "off")
 
         if isinstance(cfg.get("golden_cooldown"), (int, float)):
             self._golden_cooldown.set(float(cfg["golden_cooldown"]))
@@ -451,17 +526,22 @@ class ClickerApp:
             # Sync the individual key vars to match the saved toggle state
             self._set_group(LETTER_KEYS, cfg["letters_toggle"])
 
+        wx, wy = cfg.get("window_x"), cfg.get("window_y")
+        if isinstance(wx, int) and isinstance(wy, int):
+            self.root.geometry(f"+{wx}+{wy}")
+
     def _save_config(self):
         cfg = {
             "target_x":     self.target_x,
             "target_y":     self.target_y,
             "keys":         {k: v.get() for k, v in self._key_vars.items()},
             "hotkey":       self._current_hotkey,
-            "avoid_golden":    self._avoid_golden.get(),
-            "auto_skip":       self._auto_skip.get(),
+            "golden_mode":     self._golden_mode.get(),
             "golden_cooldown": round(self._golden_cooldown.get(), 1),
             "target_cps":      self._target_cps.get(),
             "letters_toggle":  self._letters_toggle.get(),
+            "window_x":        self.root.winfo_x(),
+            "window_y":        self.root.winfo_y(),
         }
         try:
             with open(CONFIG_PATH, "w") as f:
@@ -548,14 +628,30 @@ class ClickerApp:
         if self._arr is None:
             self._rebuild_cache()
 
+        self._gold_last_seen = -999.0
         self.running = True
         self._set_status(True)
         threading.Thread(target=self._loop, args=(hwnd,), daemon=True).start()
-        threading.Thread(target=self._popup_watcher, daemon=True).start()
+        threading.Thread(target=self._popup_watcher, args=(hwnd,), daemon=True).start()
+        threading.Thread(target=self._golden_watcher, daemon=True).start()
         self._tick_cps()
 
     def _stop(self):
         self.running = False
+
+    def _on_alt_press(self):
+        """Called when user presses Alt — stop clicker immediately."""
+        if self.running:
+            self.root.after(0, self._stop)
+
+    def _release_all_keys(self):
+        """Send key-up for every active key to ensure nothing stays held."""
+        items = [_key_evt(KEY_MAP[k], True)
+                 for k, v in self._key_vars.items() if v.get()]
+        if items:
+            n = len(items)
+            ctypes.windll.user32.SendInput(
+                n, (Input * n)(*items), ctypes.sizeof(Input))
 
     # ── Window helper ──────────────────────────────────────────────────────
 
@@ -572,45 +668,209 @@ class ClickerApp:
 
     # ── Popup watcher ──────────────────────────────────────────────────────
 
-    def _popup_watcher(self):
-        """Separate thread: scans for the Outbreaks popup and clicks Skip."""
-        hdc      = ctypes.windll.user32.GetDC(0)
-        screen_w = ctypes.windll.user32.GetSystemMetrics(0)
-        screen_h = ctypes.windll.user32.GetSystemMetrics(1)
-        send     = ctypes.windll.user32.SendInput
-        sz       = ctypes.sizeof(Input)
+    def _debug_capture(self):
+        """Capture the game window scan area, highlight matching pixels, open result."""
+        def _run():
+            time.sleep(3)
+            hwnd = self._find_window()
+            if not hwnd:
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "Capture", "Game window not found."))
+                return
+
+            from PIL import Image, ImageDraw, ImageGrab
+
+            wx1, wy1, wx2, wy2 = win32gui.GetWindowRect(hwnd)
+            ww, wh = wx2 - wx1, wy2 - wy1
+            cx, cy = (wx1 + wx2) // 2, (wy1 + wy2) // 2
+            sx1 = cx - ww // 5
+            sx2 = cx + ww // 5
+            sy1 = cy - wh * 3 // 10
+            sy2 = cy + wh * 3 // 10
+
+            STEP = 6
+            scan_cols = max(1, (sx2 - sx1) // STEP)
+            min_hits  = max(5, scan_cols // 5)
+
+            img  = ImageGrab.grab(bbox=(sx1, sy1, sx2, sy2))
+            over = Image.new("RGBA", img.size, (0, 0, 0, 0))
+            draw = ImageDraw.Draw(over)
+            iw, ih = img.size
+
+            purple_rows: dict[int, int] = {}
+            grey_hits_total = 0
+
+            for py in range(0, ih, STEP):
+                for px in range(0, iw, STEP):
+                    r, g, b = img.getpixel((px, py))
+                    if b > 130 and r > 90 and b > r and r > g and g < 165:
+                        draw.rectangle([px - 3, py - 3, px + 3, py + 3],
+                                       fill=(255, 0, 255, 200))
+                        purple_rows[py] = purple_rows.get(py, 0) + 1
+                    elif (26 <= r <= 90 and 26 <= g <= 90 and 26 <= b <= 90
+                          and abs(r - g) < 26 and abs(r - b) < 26):
+                        draw.rectangle([px - 3, py - 3, px + 3, py + 3],
+                                       fill=(0, 220, 220, 200))
+                        grey_hits_total += 1
+
+            best_purple_row  = max(purple_rows.values()) if purple_rows else 0
+            purple_hits_total = sum(purple_rows.values())
+            trigger_rows = [y for y, h in purple_rows.items() if h >= min_hits]
+
+            result = Image.alpha_composite(img.convert("RGBA"), over)
+            out = os.path.join(_BASE, "popup_debug.png")
+            result.save(out)
+            os.startfile(out)
+
+            detect_result = _find_popup_skip(hwnd)
+            status = f"✓ Detected — Skip at {detect_result}" if detect_result else "✗ Not detected"
+
+            msg = (f"Detection: {status}\n\n"
+                   f"Purple hits total: {purple_hits_total}  (best row: {best_purple_row})\n"
+                   f"Grey hits total:   {grey_hits_total}\n"
+                   f"Trigger rows found (≥{min_hits} hits): {len(trigger_rows)}\n\n"
+                   f"Magenta = purple matches  |  Cyan = grey matches")
+            self.root.after(0, lambda: messagebox.showinfo("Capture result", msg))
+
+        messagebox.showinfo("Capture",
+                            "Capturing in 3 seconds…\n"
+                            "Switch to the game and open a popup, then wait.")
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _debug_capture_golden(self):
+        """Capture area around current cursor, highlight golden pixel matches, open result."""
+        RADIUS = 60
+
+        def _run():
+            time.sleep(3)
+            mx, my = win32api.GetCursorPos()
+
+            from PIL import Image, ImageDraw, ImageGrab
+
+            bx1, by1 = mx - RADIUS, my - RADIUS
+            bx2, by2 = mx + RADIUS, my + RADIUS
+
+            img  = ImageGrab.grab(bbox=(bx1, by1, bx2, by2))
+            over = Image.new("RGBA", img.size, (0, 0, 0, 0))
+            draw = ImageDraw.Draw(over)
+            iw, ih = img.size
+
+            orange_hits = 0
+            yellow_hits = 0
+
+            for py in range(ih):
+                for px in range(iw):
+                    r, g, b = img.getpixel((px, py))
+                    if r > 120 and g > 70 and b < 100 and r > g and (r - b) > 70:
+                        draw.rectangle([px - 2, py - 2, px + 2, py + 2],
+                                       fill=(255, 80, 0, 220))   # orange = amber body
+                        orange_hits += 1
+                    elif r > 160 and g > 140 and b < 90 and abs(r - g) < 60 and (r - b) > 80:
+                        draw.rectangle([px - 2, py - 2, px + 2, py + 2],
+                                       fill=(255, 230, 0, 220))  # yellow = orbital ring
+                        yellow_hits += 1
+
+            # Mark the 9 sample points actually used by _pixel_is_golden
+            cx, cy = RADIUS, RADIUS
+            for spx, spy in (
+                (cx, cy),
+                (cx + 12, cy), (cx - 12, cy),
+                (cx, cy + 12), (cx, cy - 12),
+                (cx + 9,  cy + 9),  (cx - 9,  cy + 9),
+                (cx + 9,  cy - 9),  (cx - 9,  cy - 9),
+            ):
+                draw.ellipse([spx - 4, spy - 4, spx + 4, spy + 4],
+                             outline=(255, 255, 255, 255), width=2)
+
+            result = Image.alpha_composite(img.convert("RGBA"), over)
+            out = os.path.join(_BASE, "golden_debug.png")
+            result.save(out)
+            os.startfile(out)
+
+            msg = (f"Cursor was at ({mx}, {my})\n\n"
+                   f"Orange dots = amber body matches ({orange_hits} px)\n"
+                   f"Yellow dots = orbital ring matches ({yellow_hits} px)\n"
+                   f"White circles = the 9 sample points\n\n"
+                   f"Detection fires if ANY sample point is orange or yellow.")
+            self.root.after(0, lambda: messagebox.showinfo("Golden capture", msg))
+
+        messagebox.showinfo("Capture golden",
+                            "Capturing in 3 seconds…\n"
+                            "Move your cursor over the golden sphere in the game, then hold still.")
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _golden_watcher(self):
+        """Daemon thread: samples cursor position for golden sphere at ~20 Hz.
+
+        Runs PIL ImageGrab off the click loop so the hot path has zero PIL
+        overhead — the loop just reads the shared _gold_last_seen float.
+        """
+        while self.running:
+            mode = self._golden_mode.get()
+            if mode == "avoid":
+                # Pause clicking when golden is detected
+                mx, my = win32api.GetCursorPos()
+                if _pixel_is_golden(mx, my):
+                    self._gold_last_seen = time.perf_counter()
+            # "auto" mode: _gold_last_seen is only set by popup_watcher after popup dismiss
+            # "off" mode: never update _gold_last_seen
+            time.sleep(0.03)
+
+    def _popup_watcher(self, hwnd: int):
+        """Separate thread: scans for charge popups and optionally clicks Skip.
+
+        Sets _popup_active=True as soon as a popup is detected so the clicker
+        pauses immediately, regardless of whether auto-skip is enabled.
+        """
+        send = ctypes.windll.user32.SendInput
+        sz   = ctypes.sizeof(Input)
 
         while self.running:
-            time.sleep(0.35)
+            time.sleep(0.3)
 
-            if not self._auto_skip.get():
-                continue
+            pos = _find_popup_skip(hwnd)
 
-            pos = _find_popup_skip(hdc, screen_w, screen_h)
             if pos is None:
+                if self._popup_active:
+                    self._popup_active = False
                 continue
 
-            sx, sy = pos
-            nx, ny = _normalize(sx, sy)
+            # ── Debounce: confirm popup is still there 200 ms later ────────
+            time.sleep(0.2)
+            pos = _find_popup_skip(hwnd)
+            if pos is None:
+                continue  # transient false positive — ignore
 
-            # Move cursor to Skip button then send click
-            orig = win32api.GetCursorPos()
-            ctypes.windll.user32.SetCursorPos(sx, sy)
-            time.sleep(0.06)
+            # ── Confirmed popup — pause the clicker ────────────────────────
+            self._popup_active = True
+            mode = self._golden_mode.get()
 
-            click = (Input * 2)(
-                _mouse_evt(nx, ny, MOUSEEVENTF_LEFTDOWN),
-                _mouse_evt(nx, ny, MOUSEEVENTF_LEFTUP),
-            )
-            send(2, click, sz)
+            if mode in ("avoid", "auto"):   # both modes auto-skip the popup
+                sx, sy = pos
+                nx, ny = _normalize(sx, sy)
+                orig = win32api.GetCursorPos()
+                ctypes.windll.user32.SetCursorPos(sx, sy)
+                time.sleep(0.06)
+                click = (Input * 2)(
+                    _mouse_evt(nx, ny, MOUSEEVENTF_LEFTDOWN),
+                    _mouse_evt(nx, ny, MOUSEEVENTF_LEFTUP),
+                )
+                send(2, click, sz)
+                time.sleep(0.12)
+                ctypes.windll.user32.SetCursorPos(*orig)
 
-            time.sleep(0.12)
-            ctypes.windll.user32.SetCursorPos(*orig)
+            # ── Wait until the popup is gone before clearing the flag ──────
+            for _ in range(20):        # up to ~6 s
+                time.sleep(0.3)
+                if _find_popup_skip(hwnd) is None:
+                    break
 
-            # Back-off so we don't re-trigger on the same popup
-            time.sleep(1.2)
+            # In auto mode: briefly avoid goldens after popup dismiss so the
+            # clicker returns to the target before the next golden is clicked.
+            if mode == "auto":
+                self._gold_last_seen = time.perf_counter()
 
-        ctypes.windll.user32.ReleaseDC(0, hdc)
+            self._popup_active = False
 
     # ── Clicker loop ───────────────────────────────────────────────────────
 
@@ -633,20 +893,17 @@ class ClickerApp:
         cnt         = self._arr_cnt
         sz          = self._arr_sz
         get_fg      = win32gui.GetForegroundWindow
-        avoid_gold  = self._avoid_golden.get()
-        tx, ty      = self.target_x, self.target_y
-        hdc         = ctypes.windll.user32.GetDC(0) if avoid_gold else None
+        golden_mode = self._golden_mode.get()
         interval    = 1.0 / max(self._target_cps.get(), 1)
         cooldown    = self._golden_cooldown.get()
 
         # 1 ms Windows timer resolution for precise sleep
         ctypes.windll.winmm.timeBeginPeriod(1)
 
-        n              = 0
-        chk            = 0
-        gold_last_seen = -999.0
-        t_next         = time.perf_counter()
-        t_cps          = time.perf_counter()
+        n      = 0
+        chk    = 0
+        t_next = time.perf_counter()
+        t_cps  = time.perf_counter()
 
         while self.running:
             # ── Rate limiting ──────────────────────────────────────────────
@@ -655,20 +912,21 @@ class ClickerApp:
             if wait > 0:
                 time.sleep(wait)
             t_next += interval
+            # Clamp: don't accumulate debt across missed ticks (prevents bursts)
+            if t_next < time.perf_counter():
+                t_next = time.perf_counter()
 
-            # ── Golden detection (every iteration — cheap at limited CPS) ──
             now = time.perf_counter()
-            if avoid_gold and _pixel_is_golden(hdc, tx, ty):
-                gold_last_seen = now
+            # ── Golden pause: flag is updated by _golden_watcher thread ────
+            gold_paused = (golden_mode != "off") and (now - self._gold_last_seen < cooldown)
 
-            paused = avoid_gold and (now - gold_last_seen < cooldown)
-            if not paused:
+            if not gold_paused and not self._popup_active:
                 send(cnt, arr, sz)
                 n += 1
 
-            # ── Focus + CPS update every 60 iters ─────────────────────────
+            # ── Focus + CPS update every 5 iters (~83 ms at 60 CPS) ───────
             chk += 1
-            if chk >= 60:
+            if chk >= 5:
                 chk = 0
                 if get_fg() != hwnd:
                     break
@@ -678,8 +936,7 @@ class ClickerApp:
                     n, t_cps = 0, now
 
         ctypes.windll.winmm.timeEndPeriod(1)
-        if hdc is not None:
-            ctypes.windll.user32.ReleaseDC(0, hdc)
+        self._release_all_keys()
         ctypes.windll.user32.SetCursorPos(*orig)
         self.running = False
         self.root.after(0, lambda: self._set_status(False))
@@ -689,9 +946,13 @@ class ClickerApp:
     def _tick_cps(self):
         if self.running:
             self._cps_var.set(f"CPS: {self._cps:,}")
+            self._popup_dot.config(
+                fg="#ff7700" if self._popup_active else "#444444"
+            )
             self.root.after(250, self._tick_cps)
         else:
             self._cps_var.set("CPS: –")
+            self._popup_dot.config(fg="#444444")
 
     # ── Status indicator ───────────────────────────────────────────────────
 
@@ -708,10 +969,16 @@ class ClickerApp:
     # ── Lifecycle ──────────────────────────────────────────────────────────
 
     def _on_close(self):
+        self._save_config()   # persist window position before destroying root
         self.running = False
         if self._hotkey_handle is not None:
             try:
                 keyboard.remove_hotkey(self._hotkey_handle)
+            except Exception:
+                pass
+        for h in self._alt_hooks:
+            try:
+                keyboard.unhook(h)
             except Exception:
                 pass
         self.root.destroy()
